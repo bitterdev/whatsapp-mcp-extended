@@ -40,6 +40,23 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, senderName, content
 		senderName = sender
 	}
 
+	// messages.chat_jid references chats(jid) and the connection enforces foreign keys, so a
+	// message for a chat that was never filed is rejected outright. Outgoing messages run into
+	// this whenever the address we send to is not the one the chat is filed under. File the
+	// bare chat first and let the message carry the chat forward in time; the name is left to
+	// whoever knows it, and an older message never drags the chat back.
+	if _, err := store.db.Exec(
+		`INSERT INTO chats (jid, name, last_message_time) VALUES (?, '', ?)
+		ON CONFLICT(jid) DO UPDATE SET
+			last_message_time = CASE
+				WHEN chats.last_message_time IS NULL OR excluded.last_message_time > chats.last_message_time THEN excluded.last_message_time
+				ELSE chats.last_message_time
+			END`,
+		chatJID, timestamp,
+	); err != nil {
+		return err
+	}
+
 	_, err := store.db.Exec(
 		`INSERT OR REPLACE INTO messages
 		(id, chat_jid, sender, sender_name, content, timestamp, is_from_me, media_type, filename, url, direct_path, media_key, file_sha256, file_enc_sha256, file_length)
