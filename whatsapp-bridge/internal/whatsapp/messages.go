@@ -154,6 +154,12 @@ func (c *Client) SendMessage(messageStore *database.MessageStore, recipient stri
 	var recipientJID types.JID
 	var err error
 
+	// The address we send to and the address the conversation is filed under are not always the
+	// same one: the rewrites below pick whatever the server accepts, while the chat list keeps
+	// the address the thread was first seen with. Filing a sent message under the transport
+	// address splits the thread in two, and it is then missing where the thread is read.
+	var chatJID types.JID
+
 	// Check if recipient is a JID
 	isJID := strings.Contains(recipient, "@")
 
@@ -163,6 +169,7 @@ func (c *Client) SendMessage(messageStore *database.MessageStore, recipient stri
 		if err != nil {
 			return bridgeTypes.SendResult{Success: false, Error: fmt.Sprintf("Error parsing JID: %v", err)}
 		}
+		chatJID = recipientJID
 		// WhatsApp now hands out LID addresses ("<id>@lid") for one-to-one chats, and that is what
 		// the chat list stores. Sending straight to a LID is refused by the server with error 463,
 		// so resolve it back to the phone JID we are actually allowed to address. The mapping comes
@@ -181,6 +188,28 @@ func (c *Client) SendMessage(messageStore *database.MessageStore, recipient stri
 		recipientJID = types.JID{
 			User:   recipient,
 			Server: "s.whatsapp.net", // For personal chats
+		}
+		chatJID = recipientJID
+	}
+
+	// A phone JID we have never talked to has no session and no LID mapping, and the server
+	// rejects it with error 463. Asking the server who that number is returns the canonical
+	// (LID) address and registers the mapping on the way, which turns the same send into a
+	// normal one. Known contacts keep their local mapping and never hit the network here.
+	if recipientJID.Server == types.DefaultUserServer {
+		alt, altErr := c.Store.GetAltJID(context.Background(), recipientJID)
+		if altErr != nil || alt.IsEmpty() {
+			if resp, qErr := c.IsOnWhatsApp(context.Background(), []string{"+" + recipientJID.User}); qErr == nil {
+				for _, entry := range resp {
+					if entry.IsIn && !entry.JID.IsEmpty() {
+						c.logger.Debugf("Resolved %s to %s for sending", recipientJID, entry.JID)
+						recipientJID = entry.JID
+						break
+					}
+				}
+			} else {
+				c.logger.Warnf("Could not look up %s on WhatsApp: %v", recipientJID, qErr)
+			}
 		}
 	}
 
@@ -320,9 +349,12 @@ func (c *Client) SendMessage(messageStore *database.MessageStore, recipient stri
 		sender = c.Store.ID.ToNonAD().String()
 	}
 
-	_ = messageStore.StoreMessage(
+	// A send that is not written down cannot be told apart from one that never happened, and the
+	// next run sends it again. The message is out at this point, so a failed write is reported
+	// rather than returned, but it must not stay silent.
+	if err := messageStore.StoreMessage(
 		sendResp.ID, // Use the ID from SendResponse
-		recipientJID.String(),
+		chatJID.String(),
 		sender,
 		sender,
 		content,
@@ -336,7 +368,9 @@ func (c *Client) SendMessage(messageStore *database.MessageStore, recipient stri
 		fileSHA256,
 		fileEncSHA256,
 		fileLength,
-	)
+	); err != nil {
+		c.logger.Errorf("Failed to store sent message %s for chat %s: %v", sendResp.ID, chatJID, err)
+	}
 
 	return bridgeTypes.SendResult{
 		Success:   true,
