@@ -14,9 +14,11 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waCommon"
+	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // isPhoneNumber matches strings that look like raw phone numbers (no real name).
@@ -137,8 +139,10 @@ func (c *Client) HandleMessage(messageStore *database.MessageStore, webhookManag
 	// Extract media info
 	mediaType, filename, url, directPath, mediaKey, fileSHA256, fileEncSHA256, fileLength := ExtractMediaInfo(msg.Message)
 
-	// Skip if there's no content and no media
+	// Skip if there's no content and no media, but name the message fields so
+	// an unsupported message type does not vanish without a trace.
 	if content == "" && mediaType == "" {
+		c.logger.Infof("Skipping message %s from %s without text or media, fields: %s", msg.Info.ID, chatJID, populatedFields(msg.Message))
 		return
 	}
 
@@ -438,4 +442,19 @@ func autoDownloadExtractDirectPath(rawURL string) string {
 		}
 	}
 	return rawURL
+}
+
+func populatedFields(m *waE2E.Message) string {
+	if m == nil {
+		return "none"
+	}
+	var names []string
+	m.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+		names = append(names, string(fd.Name()))
+		return true
+	})
+	if len(names) == 0 {
+		return "none"
+	}
+	return strings.Join(names, ",")
 }

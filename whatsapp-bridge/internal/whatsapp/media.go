@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"strings"
 	"time"
 
 	"go.mau.fi/whatsmeow/proto/waE2E"
@@ -83,7 +84,103 @@ func ExtractTextContent(msg *waE2E.Message) string {
 		}
 	}
 
+	// Business messages (templates, interactive, buttons, lists). Verification
+	// codes sent by WhatsApp Business accounts arrive this way and were dropped
+	// before because they carry no plain text field.
+	if text := extractBusinessText(msg); text != "" {
+		return text
+	}
+
 	return ""
+}
+
+func extractBusinessText(msg *waE2E.Message) string {
+	if tpl := msg.GetTemplateMessage(); tpl != nil {
+		if text := templateText(tpl); text != "" {
+			return text
+		}
+	}
+	if hsm := msg.GetHighlyStructuredMessage(); hsm != nil {
+		if text := templateText(hsm.GetHydratedHsm()); text != "" {
+			return text
+		}
+	}
+	if im := msg.GetInteractiveMessage(); im != nil {
+		if text := interactiveText(im); text != "" {
+			return text
+		}
+	}
+	if btn := msg.GetButtonsMessage(); btn != nil {
+		if text := joinLines(btn.GetText(), btn.GetContentText(), btn.GetFooterText()); text != "" {
+			return text
+		}
+	}
+	if list := msg.GetListMessage(); list != nil {
+		if text := joinLines(list.GetTitle(), list.GetDescription(), list.GetFooterText()); text != "" {
+			return text
+		}
+	}
+	if resp := msg.GetButtonsResponseMessage(); resp != nil {
+		if text := resp.GetSelectedDisplayText(); text != "" {
+			return text
+		}
+	}
+	if reply := msg.GetTemplateButtonReplyMessage(); reply != nil {
+		if text := reply.GetSelectedDisplayText(); text != "" {
+			return text
+		}
+	}
+	if resp := msg.GetListResponseMessage(); resp != nil {
+		if text := joinLines(resp.GetTitle(), resp.GetDescription()); text != "" {
+			return text
+		}
+	}
+	if resp := msg.GetInteractiveResponseMessage(); resp != nil {
+		if text := resp.GetBody().GetText(); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func templateText(tpl *waE2E.TemplateMessage) string {
+	if tpl == nil {
+		return ""
+	}
+	if h := tpl.GetHydratedFourRowTemplate(); h != nil {
+		if text := hydratedText(h); text != "" {
+			return text
+		}
+	}
+	if h := tpl.GetHydratedTemplate(); h != nil {
+		if text := hydratedText(h); text != "" {
+			return text
+		}
+	}
+	if im := tpl.GetInteractiveMessageTemplate(); im != nil {
+		if text := interactiveText(im); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func hydratedText(h *waE2E.TemplateMessage_HydratedFourRowTemplate) string {
+	return joinLines(h.GetHydratedTitleText(), h.GetHydratedContentText(), h.GetHydratedFooterText())
+}
+
+func interactiveText(im *waE2E.InteractiveMessage) string {
+	return joinLines(im.GetHeader().GetTitle(), im.GetBody().GetText(), im.GetFooter().GetText())
+}
+
+func joinLines(parts ...string) string {
+	var lines []string
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			lines = append(lines, p)
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 // ExtractMediaInfo extracts media information from a WhatsApp message

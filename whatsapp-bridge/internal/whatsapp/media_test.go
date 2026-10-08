@@ -71,8 +71,8 @@ func TestExtractTextContent(t *testing.T) {
 			wantText: "report.pdf",
 		},
 		{
-			name: "sticker",
-			msg:  &waE2E.Message{StickerMessage: &waE2E.StickerMessage{}},
+			name:     "sticker",
+			msg:      &waE2E.Message{StickerMessage: &waE2E.StickerMessage{}},
 			wantText: "[Sticker]",
 		},
 		{
@@ -112,6 +112,84 @@ func TestExtractTextContent(t *testing.T) {
 				Text: proto.String("👍"),
 			}},
 			wantText: "[Reaction: 👍]",
+		},
+		{
+			name: "hydrated four row template (business authentication code)",
+			msg: &waE2E.Message{TemplateMessage: &waE2E.TemplateMessage{
+				Format: &waE2E.TemplateMessage_HydratedFourRowTemplate_{HydratedFourRowTemplate: &waE2E.TemplateMessage_HydratedFourRowTemplate{
+					Title:               &waE2E.TemplateMessage_HydratedFourRowTemplate_HydratedTitleText{HydratedTitleText: "Meta"},
+					HydratedContentText: proto.String("123456 is your verification code."),
+					HydratedFooterText:  proto.String("This code expires in 10 minutes."),
+				}},
+			}},
+			wantText: "Meta\n123456 is your verification code.\nThis code expires in 10 minutes.",
+		},
+		{
+			name: "template with legacy hydrated template field",
+			msg: &waE2E.Message{TemplateMessage: &waE2E.TemplateMessage{
+				HydratedTemplate: &waE2E.TemplateMessage_HydratedFourRowTemplate{
+					HydratedContentText: proto.String("654321 is your code."),
+				},
+			}},
+			wantText: "654321 is your code.",
+		},
+		{
+			name: "interactive message with copy code button",
+			msg: &waE2E.Message{InteractiveMessage: &waE2E.InteractiveMessage{
+				Header: &waE2E.InteractiveMessage_Header{Title: proto.String("Verify")},
+				Body:   &waE2E.InteractiveMessage_Body{Text: proto.String("Your code is 112233")},
+				Footer: &waE2E.InteractiveMessage_Footer{Text: proto.String("Do not share it")},
+			}},
+			wantText: "Verify\nYour code is 112233\nDo not share it",
+		},
+		{
+			name: "template wrapping an interactive message",
+			msg: &waE2E.Message{TemplateMessage: &waE2E.TemplateMessage{
+				Format: &waE2E.TemplateMessage_InteractiveMessageTemplate{InteractiveMessageTemplate: &waE2E.InteractiveMessage{
+					Body: &waE2E.InteractiveMessage_Body{Text: proto.String("Code 445566")},
+				}},
+			}},
+			wantText: "Code 445566",
+		},
+		{
+			name: "buttons message",
+			msg: &waE2E.Message{ButtonsMessage: &waE2E.ButtonsMessage{
+				Header:      &waE2E.ButtonsMessage_Text{Text: "Header"},
+				ContentText: proto.String("Pick one"),
+				FooterText:  proto.String("Footer"),
+			}},
+			wantText: "Header\nPick one\nFooter",
+		},
+		{
+			name: "list message",
+			msg: &waE2E.Message{ListMessage: &waE2E.ListMessage{
+				Title:       proto.String("Menu"),
+				Description: proto.String("Choose an item"),
+			}},
+			wantText: "Menu\nChoose an item",
+		},
+		{
+			name: "highly structured message with hydrated template",
+			msg: &waE2E.Message{HighlyStructuredMessage: &waE2E.HighlyStructuredMessage{
+				HydratedHsm: &waE2E.TemplateMessage{HydratedTemplate: &waE2E.TemplateMessage_HydratedFourRowTemplate{
+					HydratedContentText: proto.String("778899 is your code."),
+				}},
+			}},
+			wantText: "778899 is your code.",
+		},
+		{
+			name: "buttons response",
+			msg: &waE2E.Message{ButtonsResponseMessage: &waE2E.ButtonsResponseMessage{
+				Response: &waE2E.ButtonsResponseMessage_SelectedDisplayText{SelectedDisplayText: "Yes"},
+			}},
+			wantText: "Yes",
+		},
+		{
+			name: "template button reply",
+			msg: &waE2E.Message{TemplateButtonReplyMessage: &waE2E.TemplateButtonReplyMessage{
+				SelectedDisplayText: proto.String("Confirm"),
+			}},
+			wantText: "Confirm",
 		},
 	}
 
