@@ -105,20 +105,19 @@ var allowedMediaDirs = []string{
 	"/tmp",
 }
 
-// validateMediaPath checks if the path is within allowed directories
+// validateMediaPath checks if the path resolves to a location within an
+// allowed directory. It resolves symlinks before matching so a symlink planted
+// inside an allowed directory cannot redirect os.ReadFile to an arbitrary file,
+// and it matches on path-segment boundaries so a sibling directory that merely
+// shares a name prefix (e.g. /tmproot vs /tmp) is not treated as inside the
+// allowlist.
 func validateMediaPath(mediaPath string) error {
 	if mediaPath == "" {
 		return nil
 	}
 
-	// Clean and get absolute path
-	cleanPath := filepath.Clean(mediaPath)
-	absPath, err := filepath.Abs(cleanPath)
-	if err != nil {
-		return fmt.Errorf("invalid media path: %v", err)
-	}
-
-	// Check for path traversal attempts
+	// Check for path traversal attempts. Kept before DISABLE_PATH_CHECK so that
+	// traversal is rejected even when the check is otherwise disabled.
 	if strings.Contains(mediaPath, "..") {
 		return fmt.Errorf("path traversal not allowed")
 	}
@@ -128,13 +127,32 @@ func validateMediaPath(mediaPath string) error {
 		return nil
 	}
 
-	// Check if path is within allowed directories
+	absPath, err := filepath.Abs(filepath.Clean(mediaPath))
+	if err != nil {
+		return fmt.Errorf("invalid media path: %v", err)
+	}
+
+	// os.ReadFile follows symlinks, so validation must see the real destination.
+	// Resolve symlinks on the longest existing prefix of the path: this defeats
+	// a symlink planted anywhere along the path while still permitting a leaf
+	// file that has not been created yet.
+	resolvedPath := resolveExistingPrefix(absPath)
+
+	// Check if the resolved path is within an allowed directory, matching on
+	// path-segment boundaries rather than a raw string prefix.
+	sep := string(os.PathSeparator)
 	for _, allowedDir := range allowedMediaDirs {
 		allowedAbs, err := filepath.Abs(allowedDir)
 		if err != nil {
 			continue
 		}
-		if strings.HasPrefix(absPath, allowedAbs) {
+		// Resolve symlinks in the allowed directory too (e.g. macOS /tmp is a
+		// symlink to /private/tmp); skip entries that do not exist rather than
+		// failing the whole check.
+		if resolvedAllowed, err := filepath.EvalSymlinks(allowedAbs); err == nil {
+			allowedAbs = resolvedAllowed
+		}
+		if resolvedPath == allowedAbs || strings.HasPrefix(resolvedPath, allowedAbs+sep) {
 			return nil
 		}
 	}
@@ -142,8 +160,33 @@ func validateMediaPath(mediaPath string) error {
 	return fmt.Errorf("media path outside allowed directories")
 }
 
-// SendMessage sends a WhatsApp message with optional media and mentions
-func (c *Client) SendMessage(messageStore *database.MessageStore, recipient string, message string, mediaPath string, mentionedJIDs ...[]string) bridgeTypes.SendResult {
+// resolveExistingPrefix returns absPath with its longest existing ancestor
+// passed through filepath.EvalSymlinks and any remaining (not-yet-existing)
+// components re-appended. filepath.EvalSymlinks requires the whole path to
+// exist; this walks up until it finds a component that does, so a symlink in
+// the existing portion is followed while a missing leaf file is tolerated.
+func resolveExistingPrefix(absPath string) string {
+	remainder := ""
+	current := absPath
+	for {
+		if resolved, err := filepath.EvalSymlinks(current); err == nil {
+			if remainder == "" {
+				return resolved
+			}
+			return filepath.Join(resolved, remainder)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			// Reached the filesystem root without resolving anything.
+			return absPath
+		}
+		remainder = filepath.Join(filepath.Base(current), remainder)
+		current = parent
+	}
+}
+
+// SendMessage sends a WhatsApp message with optional media, quoted message, and mentions
+func (c *Client) SendMessage(messageStore *database.MessageStore, recipient string, message string, mediaPath string, quotedMessageID string, mentionedJIDs ...[]string) bridgeTypes.SendResult {
 	if !c.IsConnected() {
 		return bridgeTypes.SendResult{Success: false, Error: "Not connected to WhatsApp"}
 	}
@@ -209,6 +252,25 @@ func (c *Client) SendMessage(messageStore *database.MessageStore, recipient stri
 				}
 			} else {
 				c.logger.Warnf("Could not look up %s on WhatsApp: %v", recipientJID, qErr)
+			}
+		}
+	}
+
+	// Safety gate: Check WHATSAPP_ALLOWLIST_JIDS if configured
+	if c.cfg != nil && len(c.cfg.AllowlistJIDs) > 0 {
+		allowed := false
+		targetStr := recipientJID.String()
+		targetUser := recipientJID.User
+		for _, a := range c.cfg.AllowlistJIDs {
+			if strings.EqualFold(a, targetStr) || strings.EqualFold(a, targetUser) || strings.Contains(targetStr, a) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return bridgeTypes.SendResult{
+				Success: false,
+				Error:   fmt.Sprintf("recipient %s is blocked by WHATSAPP_ALLOWLIST_JIDS safety gate", recipient),
 			}
 		}
 	}
@@ -320,6 +382,44 @@ func (c *Client) SendMessage(messageStore *database.MessageStore, recipient stri
 			}
 		} else {
 			msg.Conversation = proto.String(message)
+		}
+	}
+
+	// Build quoted message context if quotedMessageID is provided
+	if quotedMessageID != "" && messageStore != nil {
+		content, sender, _, err := messageStore.GetMessageContentAndSender(quotedMessageID)
+		if err == nil {
+			contextInfo := &waE2E.ContextInfo{
+				StanzaID:    proto.String(quotedMessageID),
+				Participant: proto.String(sender),
+				QuotedMessage: &waE2E.Message{
+					Conversation: proto.String(content),
+				},
+			}
+
+			if msg.ExtendedTextMessage != nil {
+				if msg.ExtendedTextMessage.ContextInfo == nil {
+					msg.ExtendedTextMessage.ContextInfo = contextInfo
+				} else {
+					msg.ExtendedTextMessage.ContextInfo.StanzaID = proto.String(quotedMessageID)
+					msg.ExtendedTextMessage.ContextInfo.Participant = proto.String(sender)
+					msg.ExtendedTextMessage.ContextInfo.QuotedMessage = contextInfo.QuotedMessage
+				}
+			} else if msg.ImageMessage != nil {
+				msg.ImageMessage.ContextInfo = contextInfo
+			} else if msg.AudioMessage != nil {
+				msg.AudioMessage.ContextInfo = contextInfo
+			} else if msg.VideoMessage != nil {
+				msg.VideoMessage.ContextInfo = contextInfo
+			} else if msg.DocumentMessage != nil {
+				msg.DocumentMessage.ContextInfo = contextInfo
+			} else if msg.Conversation != nil {
+				msg.ExtendedTextMessage = &waE2E.ExtendedTextMessage{
+					Text:        msg.Conversation,
+					ContextInfo: contextInfo,
+				}
+				msg.Conversation = nil
+			}
 		}
 	}
 
@@ -713,8 +813,13 @@ func (c *Client) SetGroupTopic(groupJID string, topic string) error {
 
 // Phase 3: Polls
 
-// CreatePoll creates and sends a poll to a chat
-func (c *Client) CreatePoll(chatJID string, question string, options []string, multiSelect bool) (bridgeTypes.SendResult, error) {
+// CreatePoll creates and sends a poll to a chat, and stores the poll (with its option list)
+// locally so that votes on it can later be decrypted and resolved back to readable option text —
+// see resolvePollVoteContent in polls.go. A poll this bridge sends never comes back to it as an
+// incoming event (self-echo only happens across other linked devices), so this is the only place
+// that poll's options are ever captured; skipping it means every future vote on this poll decrypts
+// successfully but can't be matched to an option name.
+func (c *Client) CreatePoll(messageStore *database.MessageStore, chatJID string, question string, options []string, multiSelect bool) (bridgeTypes.SendResult, error) {
 	if !c.IsConnected() {
 		return bridgeTypes.SendResult{Success: false, Error: "not connected to WhatsApp"}, fmt.Errorf("not connected to WhatsApp")
 	}
@@ -753,9 +858,24 @@ func (c *Client) CreatePoll(chatJID string, question string, options []string, m
 	}
 	c.antiban.AfterSend(antiban.Poll)
 
+	msgID := string(resp.ID)
+	if err := messageStore.StorePollOptions(msgID, chatJID, options); err != nil {
+		c.logger.Warnf("Failed to store poll options for %s: %v", msgID, err)
+	}
+	var ownJID string
+	if c.Store != nil && c.Store.ID != nil {
+		ownJID = c.Store.ID.ToNonAD().String()
+	}
+	if err := messageStore.StoreMessage(
+		msgID, chatJID, ownJID, "", fmt.Sprintf("[Poll: %s]", question),
+		resp.Timestamp, true, "", "", "", "", nil, nil, nil, 0,
+	); err != nil {
+		c.logger.Warnf("Failed to store sent poll message %s: %v", msgID, err)
+	}
+
 	return bridgeTypes.SendResult{
 		Success:   true,
-		MessageID: string(resp.ID),
+		MessageID: msgID,
 		Timestamp: resp.Timestamp,
 	}, nil
 }

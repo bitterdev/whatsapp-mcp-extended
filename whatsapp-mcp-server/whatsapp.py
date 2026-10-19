@@ -1,7 +1,10 @@
+import base64
+import binascii
 import json
 import os
 import os.path
 import sqlite3
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -31,7 +34,6 @@ import audio
 from lib.bridge import _get_headers
 from lib.utils import MESSAGES_DB_PATH, WHATSAPP_DB_PATH
 
-
 # Use environment variable for bridge host, default to localhost:8080 for development
 # BRIDGE_HOST can be "hostname" (uses :8080) or "hostname:port" (uses specified port)
 _bridge_host = os.getenv("BRIDGE_HOST", "localhost:8080")
@@ -39,6 +41,13 @@ if ":" not in _bridge_host:
     _bridge_host = f"{_bridge_host}:8080"
 BRIDGE_HOST = _bridge_host
 WHATSAPP_API_BASE_URL = f"http://{BRIDGE_HOST}/api"
+
+# Where base64 uploads are staged for the bridge to read. Must stay one of the
+# directories allowed by validateMediaPath in the Go bridge
+# (whatsapp-bridge/internal/whatsapp/messages.go); /tmp is the only one of those
+# not tied to a particular deployment layout. Literal rather than
+# tempfile.gettempdir(), since the allowlist names that exact path.
+MEDIA_TEMP_DIR = "/tmp"
 
 
 @dataclass
@@ -56,7 +65,7 @@ class Message:
 
     def to_dict(self) -> dict[str, Any]:
         """Convert Message to dictionary for structured output."""
-        result = {
+        result: dict[str, Any] = {
             "id": self.id,
             "chat_jid": self.chat_jid,
             "chat_name": self.chat_name,
@@ -102,6 +111,41 @@ class Chat:
         }
 
 
+def _resolve_equivalent_jids(jid: str) -> list[str]:
+    """Resolve a JID to its LID/phone equivalent(s) using whatsmeow_lid_map.
+
+    WhatsApp migrated one-to-one chats to LID addressing. A single conversation
+    can be split across two chat_jid values in messages.db:
+      - Phone format: 34663060433@s.whatsapp.net
+      - LID format:   154713345548441@lid
+
+    Returns a list including the original JID plus any equivalent found.
+    Groups (@g.us) and unknown suffixes pass through unchanged.
+    """
+    if "@" not in jid:
+        return [jid]
+    bare, suffix = jid.split("@", 1)
+    if suffix not in ("s.whatsapp.net", "lid"):
+        return [jid]
+    try:
+        conn = sqlite3.connect(WHATSAPP_DB_PATH)
+        cursor = conn.cursor()
+        if suffix == "s.whatsapp.net":
+            row = cursor.execute("SELECT lid FROM whatsmeow_lid_map WHERE pn = ?", (bare,)).fetchone()
+            if row:
+                return [jid, f"{row[0]}@lid"]
+        else:
+            row = cursor.execute("SELECT pn FROM whatsmeow_lid_map WHERE lid = ?", (bare,)).fetchone()
+            if row:
+                return [jid, f"{row[0]}@s.whatsapp.net"]
+        return [jid]
+    except sqlite3.Error:
+        return [jid]
+    finally:
+        if "conn" in locals():
+            conn.close()
+
+
 @dataclass
 class Contact:
     phone_number: str
@@ -132,6 +176,14 @@ class MessageContext:
     message: Message
     before: list[Message]
     after: list[Message]
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert MessageContext to dictionary."""
+        return {
+            "message": self.message.to_dict(),
+            "before": [message.to_dict() for message in self.before],
+            "after": [message.to_dict() for message in self.after],
+        }
 
 
 def get_sender_name(sender_jid: str) -> str:
@@ -215,7 +267,7 @@ def get_sender_name(sender_jid: str) -> str:
             messages_conn.close()
 
 
-def format_message(message: Message, show_chat_info: bool = True) -> None:
+def format_message(message: Message, show_chat_info: bool = True) -> str:
     """Print a single message with consistent formatting."""
     output = ""
 
@@ -236,7 +288,7 @@ def format_message(message: Message, show_chat_info: bool = True) -> None:
     return output
 
 
-def format_messages_list(messages: list[Message], show_chat_info: bool = True) -> None:
+def format_messages_list(messages: list[Message], show_chat_info: bool = True) -> str:
     output = ""
     if not messages:
         output += "No messages to display."
@@ -273,7 +325,7 @@ def list_messages(
         ]
         query_parts.append("JOIN chats ON messages.chat_jid = chats.jid")
         where_clauses = []
-        params = []
+        params: list[Any] = []
 
         # Add filters
         if after:
@@ -297,8 +349,14 @@ def list_messages(
             params.append(sender_phone_number)
 
         if chat_jid:
-            where_clauses.append("messages.chat_jid = ?")
-            params.append(chat_jid)
+            equiv = _resolve_equivalent_jids(chat_jid)
+            if len(equiv) > 1:
+                ph = ",".join("?" * len(equiv))
+                where_clauses.append(f"messages.chat_jid IN ({ph})")
+                params.extend(equiv)
+            else:
+                where_clauses.append("messages.chat_jid = ?")
+                params.append(chat_jid)
 
         if query:
             where_clauses.append("LOWER(messages.content) LIKE LOWER(?)")
@@ -472,7 +530,7 @@ def list_chats(
     page: int = 0,
     include_last_message: bool = True,
     sort_by: str = "last_active",
-) -> list[Chat]:
+) -> list[dict[str, Any]]:
     """Get chats matching the specified criteria."""
     print(f"Debug: Database path: {MESSAGES_DB_PATH}")
     print(f"Debug: Database exists: {os.path.exists(MESSAGES_DB_PATH)}")
@@ -525,7 +583,7 @@ def list_chats(
         ]
 
         where_clauses = []
-        params = []
+        params: list[Any] = []
 
         if query:
             where_clauses.append("(LOWER(chats.name) LIKE LOWER(?) OR chats.jid LIKE ?)")
@@ -656,8 +714,13 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[dict[str
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
 
+        equiv = _resolve_equivalent_jids(jid)
+        bare_ids = [e.split("@")[0] for e in equiv]
+        sender_ph = ",".join("?" * len(bare_ids))
+        jid_ph = ",".join("?" * len(equiv))
+
         cursor.execute(
-            """
+            f"""
             SELECT DISTINCT
                 c.jid,
                 c.name,
@@ -668,11 +731,11 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[dict[str
                 m.is_from_me as last_is_from_me
             FROM chats c
             JOIN messages m ON c.jid = m.chat_jid
-            WHERE m.sender = ? OR c.jid = ?
+            WHERE m.sender IN ({sender_ph}) OR c.jid IN ({jid_ph})
             ORDER BY c.last_message_time DESC
             LIMIT ? OFFSET ?
         """,
-            (jid, jid, limit, page * limit),
+            (*bare_ids, *equiv, limit, page * limit),
         )
 
         chats = cursor.fetchall()
@@ -706,8 +769,13 @@ def get_last_interaction(jid: str) -> dict[str, Any] | None:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
 
+        equiv = _resolve_equivalent_jids(jid)
+        bare_ids = [e.split("@")[0] for e in equiv]
+        sender_ph = ",".join("?" * len(bare_ids))
+        jid_ph = ",".join("?" * len(equiv))
+
         cursor.execute(
-            """
+            f"""
             SELECT
                 m.timestamp,
                 m.sender,
@@ -721,11 +789,11 @@ def get_last_interaction(jid: str) -> dict[str, Any] | None:
                 m.file_length
             FROM messages m
             JOIN chats c ON m.chat_jid = c.jid
-            WHERE m.sender = ? OR c.jid = ?
+            WHERE m.sender IN ({sender_ph}) OR c.jid IN ({jid_ph})
             ORDER BY m.timestamp DESC
             LIMIT 1
         """,
-            (jid, jid),
+            (*bare_ids, *equiv),
         )
 
         msg_data = cursor.fetchone()
@@ -821,8 +889,11 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> dict[str, Any] | Non
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
 
+        equiv = _resolve_equivalent_jids(f"{sender_phone_number}@s.whatsapp.net")
+        jid_ph = ",".join("?" * len(equiv))
+
         cursor.execute(
-            """
+            f"""
             SELECT
                 c.jid,
                 c.name,
@@ -833,10 +904,10 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> dict[str, Any] | Non
             FROM chats c
             LEFT JOIN messages m ON c.jid = m.chat_jid
                 AND c.last_message_time = m.timestamp
-            WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us'
+            WHERE c.jid IN ({jid_ph}) AND c.jid NOT LIKE '%@g.us'
             LIMIT 1
         """,
-            (f"%{sender_phone_number}%",),
+            equiv,
         )
 
         chat_data = cursor.fetchone()
@@ -862,13 +933,19 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> dict[str, Any] | Non
             conn.close()
 
 
-def send_message(recipient: str, message: str, mentioned_jids: list[str] | None = None) -> dict[str, Any]:
+def send_message(
+    recipient: str,
+    message: str,
+    mentioned_jids: list[str] | None = None,
+    quoted_message_id: str | None = None,
+) -> dict[str, Any]:
     """Send a WhatsApp message and return structured result with message_id.
 
     Args:
         recipient: WhatsApp JID of the recipient
         message: Text content to send
         mentioned_jids: Optional list of JIDs to mention (e.g. ["5521998593002@s.whatsapp.net"])
+        quoted_message_id: Optional ID of a message to quote/reply to
     """
     try:
         # Validate input
@@ -882,6 +959,8 @@ def send_message(recipient: str, message: str, mentioned_jids: list[str] | None 
         }
         if mentioned_jids:
             payload["mentioned_jids"] = mentioned_jids
+        if quoted_message_id:
+            payload["quoted_message_id"] = quoted_message_id
 
         response = requests.post(url, json=payload, headers=_get_headers(), timeout=30)
 
@@ -906,15 +985,62 @@ def send_message(recipient: str, message: str, mentioned_jids: list[str] | None 
         return {"success": False, "error": f"Unexpected error: {str(e)}"}
 
 
-def send_file(recipient: str, media_path: str) -> dict[str, Any]:
-    """Send a file via WhatsApp and return structured result with message_id."""
+def send_file(
+    recipient: str,
+    media_path: str | None = None,
+    file_content_base64: str | None = None,
+    filename: str | None = None,
+) -> dict[str, Any]:
+    """Send a file via WhatsApp and return structured result with message_id.
+
+    Accepts either a path on this server's filesystem, or the file's bytes as
+    base64. The latter exists because MCP clients generally run somewhere else:
+    a client holding a file it just produced has no way to put it on this
+    server's disk, so a path-only interface makes sending it impossible.
+    """
+    temp_path: str | None = None
     try:
         # Validate input
         if not recipient:
             return {"success": False, "error": "Recipient must be provided"}
 
+        if media_path and file_content_base64:
+            return {
+                "success": False,
+                "error": "Provide either media_path or file_content_base64, not both",
+            }
+
+        if file_content_base64:
+            if not filename:
+                return {
+                    "success": False,
+                    "error": "filename must be provided with file_content_base64",
+                }
+
+            try:
+                content = base64.b64decode(file_content_base64, validate=True)
+            except (binascii.Error, ValueError) as e:
+                return {"success": False, "error": f"Invalid base64 content: {str(e)}"}
+
+            # The bridge reads the file off disk, so the bytes have to land
+            # there first — and somewhere validateMediaPath allows.
+            media_dir = os.path.join(MEDIA_TEMP_DIR, "whatsapp-outgoing")
+            os.makedirs(media_dir, exist_ok=True)
+            # Only the basename: a filename like "../x" must not escape. The
+            # bridge also rejects any path containing "..", so a traversal
+            # attempt would fail there too.
+            safe_name = os.path.basename(filename) or "upload"
+            fd, temp_path = tempfile.mkstemp(suffix=f"-{safe_name}", dir=media_dir)
+            with os.fdopen(fd, "wb") as f:
+                f.write(content)
+
+            media_path = temp_path
+
         if not media_path:
-            return {"success": False, "error": "Media path must be provided"}
+            return {
+                "success": False,
+                "error": "Either media_path or file_content_base64 must be provided",
+            }
 
         if not os.path.isfile(media_path):
             return {"success": False, "error": f"Media file not found: {media_path}"}
@@ -943,6 +1069,14 @@ def send_file(recipient: str, media_path: str) -> dict[str, Any]:
         return {"success": False, "error": f"Error parsing response: {response.text}"}
     except Exception as e:
         return {"success": False, "error": f"Unexpected error: {str(e)}"}
+    finally:
+        # The bridge reads the file synchronously during /send, so it is safe to
+        # remove once that call has returned either way.
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 
 def send_audio_message(recipient: str, media_path: str) -> dict[str, Any]:
@@ -1013,6 +1147,12 @@ def download_media(message_id: str, chat_jid: str) -> str | None:
             result = response.json()
             if result.get("success", False):
                 path = result.get("path")
+                if path and not os.path.isabs(path):
+                    # The bridge reports media paths relative to its own
+                    # working directory (the bridge's project root, one
+                    # level above WA_STORE_PATH), not this server's cwd.
+                    bridge_root = os.path.dirname(os.path.dirname(MESSAGES_DB_PATH))
+                    path = os.path.join(bridge_root, path)
                 print(f"Media downloaded successfully: {path}")
                 return path
             else:
